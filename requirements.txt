@@ -1,0 +1,11 @@
+fastapi==0.100.0
+uvicorn[standard]==0.23.0
+python-dotenv==1.0.0
+openai==0.28.0
+sqlalchemy==2.0.40  # latest stable release as of April 2025
+psycopg2-binary==2.9.10
+streamlit==1.41.0
+requests>=2.32.3
+pandas>=2.2.3  # for DB Explorer
+pymysql>=1.0.2  # MySQL connector
+pymongo>=4.5.0  # MongoDB connector

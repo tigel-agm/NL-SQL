@@ -14,6 +14,20 @@ from urllib.parse import urlparse
 from fastapi.responses import JSONResponse
 import re
 
+
+# Helper function to get list tables query based on dialect
+def get_list_tables_query(dialect: str) -> str:
+    """Returns the SQL query for listing tables based on the database dialect."""
+    if dialect.startswith("postgres"):
+        return "SELECT table_name FROM information_schema.tables WHERE table_schema='public';"
+    elif dialect.startswith("mysql"):
+        return "SHOW TABLES;"
+    elif dialect.startswith("sqlite"):
+        return "SELECT name FROM sqlite_master WHERE type='table';"
+    else:
+        return ""  # Return empty string for unsupported dialects or if no specific query is needed
+
+
 # Load environment variables for API keys
 dotenv_path = find_dotenv()
 if dotenv_path:
@@ -123,38 +137,25 @@ def translate_and_query(req: QueryRequest):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"MongoDB execution error: {e}")
     else:
-        # Direct handling for list/show tables prompts per dialect
-        if scheme.startswith("postgres") and re.search(r"\b(?:list|show)\b.*\btables?\b", req.question, re.IGNORECASE):
-            sql_query = "SELECT table_name FROM information_schema.tables WHERE table_schema='public';"
-            try:
-                engine = create_engine(req.connection_url)
-                with engine.connect() as conn:
-                    result = conn.execute(text(sql_query))
-                    rows = [dict(r._mapping) for r in result.fetchall()]
-                    columns = list(result.keys())
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"PostgreSQL execution error: {e}")
-        elif scheme.startswith("mysql") and re.search(r"\b(?:list|show)\b.*\btables?\b", req.question, re.IGNORECASE):
-            sql_query = "SHOW TABLES;"
-            try:
-                engine = create_engine(req.connection_url)
-                with engine.connect() as conn:
-                    result = conn.execute(text(sql_query))
-                    rows = [dict(r._mapping) for r in result.fetchall()]
-                    columns = list(result.keys())
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"MySQL execution error: {e}")
-        elif scheme.startswith("sqlite") and re.search(r"\b(?:list|show)\b.*\btables?\b", req.question, re.IGNORECASE):
-            sql_query = "SELECT name FROM sqlite_master WHERE type='table';"
-            try:
-                engine = create_engine(req.connection_url)
-                with engine.connect() as conn:
-                    result = conn.execute(text(sql_query))
-                    rows = [dict(r._mapping) for r in result.fetchall()]
-                    columns = list(result.keys())
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"SQLite execution error: {e}")
-        else:
+        # Check if the question is about listing tables
+        is_list_tables_query = re.search(r"\b(?:list|show)\b.*\btables?\b", req.question, re.IGNORECASE)
+        
+        if is_list_tables_query:
+            sql_query = get_list_tables_query(scheme)
+            if sql_query:  # If a specific query exists for the dialect
+                try:
+                    engine = create_engine(req.connection_url)
+                    with engine.connect() as conn:
+                        result = conn.execute(text(sql_query))
+                        rows = [dict(r._mapping) for r in result.fetchall()]
+                        columns = list(result.keys())
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Error executing list tables query: {e}")
+            else:
+                # Fallback to general SQL generation if dialect not supported by helper or not a list tables query
+                is_list_tables_query = False # Ensure we proceed to general SQL generation
+        
+        if not is_list_tables_query: # If not a list tables query or fallback needed
             # Schema introspection for SQL prompt
             metadata = None
             try:
@@ -227,16 +228,18 @@ def translate_and_query(req: QueryRequest):
     # Persist to history
     try:
         timestamp = datetime.utcnow().isoformat()
+        # Determine what to save as "sql" for history based on query type
+        history_sql_entry = content if scheme.startswith("mongodb") else sql_query
         with history_engine.begin() as conn:
             conn.execute(text(
                 "INSERT INTO query_history (question, sql, result, created_at) "
                 "VALUES (:q, :s, :r, :c)"
-            ), {"q": req.question, "s": sql_query if not scheme.startswith("mongodb") else content, "r": json.dumps(rows), "c": timestamp})
+            ), {"q": req.question, "s": history_sql_entry, "r": json.dumps(rows), "c": timestamp})
     except Exception:
         pass
 
     # Return response
-    display_query = sql_query if not scheme.startswith("mongodb") else content
+    display_query = content if scheme.startswith("mongodb") else sql_query
     return QueryResponse(sql=display_query, columns=columns, rows=rows)
 
 @app.get("/history", response_model=List[HistoryItem])

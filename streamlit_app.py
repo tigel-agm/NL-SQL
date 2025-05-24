@@ -20,6 +20,16 @@ HISTORY_URL = os.getenv("NL_SQL_HISTORY_URL", "http://localhost:8001/history")
 st.set_page_config(page_title="NL SQL Assistant", layout="wide")
 st.title("Natural Language SQL Assistant")
 
+# Initialize session state variables if they don't exist
+if 'query_results_df' not in st.session_state:
+    st.session_state.query_results_df = None
+if 'sql_query_text' not in st.session_state:
+    st.session_state.sql_query_text = ""
+if 'data_profiling_df' not in st.session_state: # For persisting profiling results
+    st.session_state.data_profiling_df = None
+if 'performance_insights_df' not in st.session_state: # For persisting performance insights
+    st.session_state.performance_insights_df = None
+
 tab1, tab2, tab3 = st.tabs(["Query", "History", "Explorer"])
 
 with tab1:
@@ -130,95 +140,165 @@ with tab1:
         elif not connection_url.strip():
             st.warning("Please configure the database connection.")
         else:
+            # Clear previous results when a new query is run
+            st.session_state.query_results_df = None
+            st.session_state.sql_query_text = ""
+            st.session_state.data_profiling_df = None
+            st.session_state.performance_insights_df = None
+
             with st.spinner("Generating and executing SQL..."):
+                data_api_response = None # Use a different variable name to avoid confusion with session_state
                 try:
                     resp = requests.post(API_URL, json={"question": question, "connection_url": connection_url})
-                    try:
-                        resp_json = resp.json()
-                    except ValueError:
-                        resp_json = {}
                     if resp.status_code != 200:
-                        detail = resp_json.get("detail", resp.text)
-                        st.error(f"API Error ({resp.status_code}): {detail}")
+                        error_message = resp.text
+                        try:
+                            error_message = resp.json().get("detail", resp.text)
+                        except ValueError:
+                            pass
+                        st.error(f"An error occurred with the API request. Server responded with status {resp.status_code}: {error_message}")
                         st.stop()
-                    data = resp_json
+                    data_api_response = resp.json()
                 except requests.exceptions.RequestException as e:
-                    st.error(f"Network error: {e}")
+                    st.error(f"Failed to connect to the backend API at {API_URL}. Please ensure the backend is running and accessible. Error: {e}")
+                    st.stop()
+                except json.JSONDecodeError as e:
+                    st.error(f"Error decoding API response (expected JSON): {e}. Response text: {resp.text[:200]}...")
+                    st.stop()
                 except Exception as e:
-                    st.error(f"Unexpected error: {e}")
-                st.subheader("Generated SQL")
-                st.code(data.get("sql", ""), language="sql")
+                    st.error(f"An unexpected error occurred while communicating with the API: {e}")
+                    st.stop()
 
-                st.subheader("Results")
-                rows = data.get("rows", [])
-                if rows:
-                    df = pd.DataFrame(rows)
-                    st.dataframe(df)
-                    # Visualization options
-                    chart_type = st.selectbox("Chart Type", ["None", "Line", "Bar", "Area"], key="chart_type")
-                    if chart_type != "None":
-                        if chart_type == "Line":
-                            st.line_chart(df)
-                        elif chart_type == "Bar":
-                            st.bar_chart(df)
-                        else:
-                            st.area_chart(df)
-                    # Download results
-                    csv = df.to_csv(index=False)
-                    st.download_button("Download CSV", csv, "results.csv", "text/csv", key="download")
-                else:
-                    st.info("No rows returned.")
-
-                # Performance Insights
-                st.subheader("Performance Insights")
-                try:
-                    from sqlalchemy import text as sql_text_fn
-                    engine_insights = create_engine(connection_url)
-                    sql_text = data.get("sql", "")
-                    if connection_url.startswith("sqlite"):
-                        plan_sql = f"EXPLAIN QUERY PLAN {sql_text}"
-                    elif connection_url.startswith("postgresql"):
-                        plan_sql = f"EXPLAIN ANALYZE {sql_text}"
-                    elif connection_url.startswith("mysql"):
-                        plan_sql = f"EXPLAIN {sql_text}"
+                if data_api_response:
+                    st.session_state.sql_query_text = data_api_response.get("sql", "")
+                    rows = data_api_response.get("rows", [])
+                    if rows:
+                        st.session_state.query_results_df = pd.DataFrame(rows)
                     else:
-                        plan_sql = None
-                    if plan_sql:
-                        with engine_insights.connect() as conn_plan:
-                            res_plan = conn_plan.execute(text(plan_sql))
-                            df_plan = pd.DataFrame(res_plan.fetchall(), columns=res_plan.keys())
-                            st.table(df_plan)
-                except Exception as e:
-                    st.error(f"Performance insights error: {e}")
+                        st.session_state.query_results_df = pd.DataFrame() # Use empty DataFrame for "no rows"
 
-                # Data Profiling
-                st.subheader("Data Profiling")
+                    # Automatically run Performance Insights if SQL was generated
+                    if st.session_state.sql_query_text and not connection_url.startswith("mongodb"):
+                        try:
+                            from sqlalchemy import text as sql_text_fn # Keep import local
+                            engine_insights = create_engine(connection_url)
+                            sql_text_perf = st.session_state.sql_query_text
+                            plan_sql = None
+                            if connection_url.startswith("sqlite"):
+                                plan_sql = f"EXPLAIN QUERY PLAN {sql_text_perf}"
+                            elif connection_url.startswith("postgresql"):
+                                plan_sql = f"EXPLAIN ANALYZE {sql_text_perf}"
+                            elif connection_url.startswith("mysql"):
+                                plan_sql = f"EXPLAIN {sql_text_perf}"
+                            
+                            if plan_sql:
+                                with engine_insights.connect() as conn_plan:
+                                    res_plan = conn_plan.execute(sql_text_fn(plan_sql))
+                                    st.session_state.performance_insights_df = pd.DataFrame(res_plan.fetchall(), columns=res_plan.keys())
+                        except Exception as e:
+                            # Silently fail for performance insights for now, or use st.info/st.warning
+                            print(f"Performance insights error: {e}") # Log for debugging
+                            st.session_state.performance_insights_df = None
+
+
+    # --- Display sections based on session state (outside the button logic) ---
+    if st.session_state.sql_query_text:
+        st.subheader("Generated SQL")
+        st.code(st.session_state.sql_query_text, language="sql")
+
+    if st.session_state.query_results_df is not None:
+        st.subheader("Results")
+        if not st.session_state.query_results_df.empty:
+            st.dataframe(st.session_state.query_results_df)
+            # Visualization options
+            chart_type = st.selectbox("Chart Type", ["None", "Line", "Bar", "Area"], key="chart_type")
+            if chart_type != "None":
                 try:
-                    engine_profile = create_engine(connection_url)
+                    if chart_type == "Line":
+                        st.line_chart(st.session_state.query_results_df)
+                    elif chart_type == "Bar":
+                        st.bar_chart(st.session_state.query_results_df)
+                    else: # Area
+                        st.area_chart(st.session_state.query_results_df)
+                except Exception as e:
+                    st.error(f"Error rendering {chart_type.lower()} chart: {e}")
+            
+            # Download results
+            try:
+                csv_data = st.session_state.query_results_df.to_csv(index=False)
+                st.download_button("Download CSV", csv_data, "results.csv", "text/csv", key="download")
+            except Exception as e:
+                st.error(f"Error preparing CSV for download: {e}")
+        else: # Empty DataFrame means query ran but returned no rows
+            st.info("No rows returned or the query was a DDL/DML statement.")
+            
+    if st.session_state.performance_insights_df is not None and not st.session_state.performance_insights_df.empty:
+        st.subheader("Performance Insights")
+        st.table(st.session_state.performance_insights_df)
+    elif st.session_state.sql_query_text and not connection_url.startswith("mongodb"): # Query was run but no insights
+        st.subheader("Performance Insights")
+        st.info("Performance insights could not be generated for this query or database type.")
+
+
+    # Data Profiling - this can remain more independent but also use session state if we want to persist its result
+    if connection_url and not connection_url.startswith("mongodb"): # Only for SQL DBs
+        st.subheader("Data Profiling")
+        try:
+            engine_profile = create_engine(connection_url)
                     md_profile = MetaData()
                     md_profile.reflect(bind=engine_profile)
                     tables_profile = list(md_profile.tables.keys())
+                    
+                    if 'profile_tbl_selection' not in st.session_state:
+                        st.session_state.profile_tbl_selection = tables_profile[0] if tables_profile else None
+
                     if tables_profile:
-                        prof_tbl = st.selectbox("Choose table for profiling", tables_profile, key="profile_tbl")
+                        # Use a callback to update selection and clear old profiling data
+                        def on_profile_table_change():
+                            st.session_state.data_profiling_df = None
+                            st.session_state.profile_tbl_selection = st.session_state.profile_tbl_widget # new selection
+
+                        prof_tbl = st.selectbox(
+                            "Choose table for profiling", 
+                            tables_profile, 
+                            key="profile_tbl_widget", # Use a different key for the widget itself
+                            on_change=on_profile_table_change,
+                            index=tables_profile.index(st.session_state.profile_tbl_selection) if st.session_state.profile_tbl_selection in tables_profile else 0
+                        )
+
                         if st.button("Run Profiling", key="profiling_btn"):
-                            stats_list = []
-                            with engine_profile.connect() as conn_prof:
-                                for col in md_profile.tables[prof_tbl].columns:
-                                    col_name = col.name
-                                    total = conn_prof.execute(text(f"SELECT COUNT(*) as cnt FROM {prof_tbl}")).scalar()
-                                    non_null = conn_prof.execute(text(f"SELECT COUNT({col_name}) as cnt FROM {prof_tbl}")).scalar()
-                                    distinct = conn_prof.execute(text(f"SELECT COUNT(DISTINCT {col_name}) as cnt FROM {prof_tbl}")).scalar()
-                                    null_count = total - non_null
-                                    stat = {"column": col_name, "null_count": null_count, "distinct_count": distinct}
-                                    try:
-                                        res_stats = conn_prof.execute(text(f"SELECT MIN({col_name}) as min, MAX({col_name}) as max, AVG({col_name}) as avg FROM {prof_tbl}")).mappings().first()
-                                        stat.update({"min": res_stats["min"], "max": res_stats["max"], "avg": res_stats["avg"]})
-                                    except:
-                                        pass
-                                    stats_list.append(stat)
-                            st.dataframe(pd.DataFrame(stats_list))
-                except Exception as e:
-                    st.error(f"Data Profiling error: {e}")
+                            if prof_tbl: # Ensure a table is selected
+                                stats_list = []
+                                with engine_profile.connect() as conn_prof:
+                                    selected_table_obj = md_profile.tables[prof_tbl]
+                                    for col in selected_table_obj.columns:
+                                        col_name = col.name
+                                        total = conn_prof.execute(text(f"SELECT COUNT(*) as cnt FROM {prof_tbl}")).scalar_one_or_none()
+                                        non_null = conn_prof.execute(text(f"SELECT COUNT({col_name}) as cnt FROM {prof_tbl}")).scalar_one_or_none()
+                                        distinct = conn_prof.execute(text(f"SELECT COUNT(DISTINCT {col_name}) as cnt FROM {prof_tbl}")).scalar_one_or_none()
+                                        null_count = total - non_null if total is not None and non_null is not None else 0
+                                        stat = {"column": col_name, "null_count": null_count, "distinct_count": distinct}
+                                        
+                                        # Check if column type supports MIN, MAX, AVG
+                                        if col.type.python_type in (int, float) or isinstance(col.type, (pd.IntegerDtype, pd.Float64Dtype)): # Basic check
+                                            try:
+                                                res_stats_query = text(f"SELECT MIN({col_name}) as min_val, MAX({col_name}) as max_val, AVG({col_name}) as avg_val FROM {prof_tbl}")
+                                                res_stats = conn_prof.execute(res_stats_query).mappings().first()
+                                                if res_stats:
+                                                    stat.update({"min": res_stats["min_val"], "max": res_stats["max_val"], "avg": res_stats["avg_val"]})
+                                            except Exception: # Catch errors for non-numeric types if check above is not sufficient
+                                                pass # Skip min/max/avg for non-numeric or problematic columns
+                                        stats_list.append(stat)
+                                st.session_state.data_profiling_df = pd.DataFrame(stats_list)
+                        
+                        if st.session_state.data_profiling_df is not None and not st.session_state.data_profiling_df.empty:
+                            st.dataframe(st.session_state.data_profiling_df)
+                        elif st.session_state.data_profiling_df is not None and st.session_state.data_profiling_df.empty:
+                             st.info("Profiling run, but no statistics generated.")
+
+        except Exception as e:
+            st.error(f"Data Profiling setup error: {e}")
+            st.session_state.data_profiling_df = None # Clear on error
 
 with tab2:
     with st.spinner("Fetching history..."):
